@@ -11,6 +11,7 @@ import pathlib
 import typing
 
 import ops
+import pydantic
 from charmlibs import apt
 from charms.grafana_agent.v0.cos_agent import COSAgentProvider
 
@@ -34,8 +35,69 @@ class InvalidRelationDataError(Exception):
     """Invalid relation data."""
 
 
-class InvalidConfigError(Exception):
-    """Invalid configuration."""
+def _split_list(value: object) -> list[str]:
+    """Split a comma-separated config option, ignoring whitespace and empty items."""
+    if not value or not isinstance(value, str):
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+class CharmConfig(pydantic.BaseModel):
+    """Charm configuration.
+
+    The fields are in the order the charm checked them before, so the first
+    validation error is the one users already see.
+    """
+
+    advertise_prefixes: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = pydantic.Field(
+        default_factory=list, validate_default=True
+    )
+    vips: list[ipaddress.IPv4Interface | ipaddress.IPv6Interface] = pydantic.Field(
+        default_factory=list
+    )
+    tunnels: int = 2
+
+    @pydantic.field_validator("advertise_prefixes", mode="before")
+    @classmethod
+    def _parse_advertise_prefixes(
+        cls, value: object
+    ) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+        prefixes: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for prefix in _split_list(value):
+            try:
+                prefixes.append(ipaddress.ip_network(prefix, strict=False))
+            except ValueError:
+                raise ValueError(
+                    f"invalid advertise-prefixes: '{prefix}' is not an IPv4 or IPv6 prefix"
+                ) from None
+        if not prefixes:
+            raise ValueError("no advertise-prefixes configured")
+        return prefixes
+
+    @pydantic.field_validator("vips", mode="before")
+    @classmethod
+    def _parse_vips(cls, value: object) -> list[ipaddress.IPv4Interface | ipaddress.IPv6Interface]:
+        vips: list[ipaddress.IPv4Interface | ipaddress.IPv6Interface] = []
+        for vip in _split_list(value):
+            try:
+                vips.append(ipaddress.ip_interface(vip))
+            except ValueError:
+                raise ValueError(f"invalid vip in vips config: {vip}") from None
+        return vips
+
+    @pydantic.field_validator("tunnels")
+    @classmethod
+    def _validate_tunnels(cls, value: int) -> int:
+        if value <= 1:
+            raise ValueError("tunnels configuration must be greater than 1")
+        return value
+
+
+def config_error_message(error: pydantic.ValidationError) -> str:
+    """The message for the first invalid option, without pydantic's framing."""
+    first = error.errors()[0]
+    cause = first.get("ctx", {}).get("error")
+    return str(cause) if cause is not None else first["msg"]
 
 
 def join_host_port(host: str, port: int) -> str:
@@ -66,6 +128,9 @@ def join_host_port(host: str, port: int) -> str:
 
 class Charm(ops.CharmBase):
     """WireGuard gateway charm service."""
+
+    # Loaded at the start of each reconcile, before anything reads it.
+    _config: CharmConfig
 
     def __init__(self, *args: typing.Any):
         """Construct.
@@ -101,66 +166,6 @@ class Charm(ops.CharmBase):
         file.parent.mkdir(parents=True, exist_ok=True)
         return wgdb.WireguardDb(file=file)
 
-    def get_advertise_prefixes(
-        self,
-    ) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
-        """Get advertise-prefixes configuration.
-
-        Returns:
-            List of advertise prefixes.
-        """
-        prefixes = []
-        config = self.config.get("advertise-prefixes")
-        if not config:
-            config = ""
-        for prefix in str(config).split(","):
-            prefix = prefix.strip()
-            if not prefix:
-                continue
-            try:
-                prefixes.append(ipaddress.ip_network(prefix, strict=False))
-            except ValueError:
-                raise InvalidConfigError(
-                    f"invalid advertise-prefixes: '{prefix}' is not an IPv4 or IPv6 prefix"
-                )
-        if not prefixes:
-            raise InvalidConfigError("no advertise-prefixes configured")
-        return prefixes
-
-    def get_number_of_tunnels(self) -> int:
-        """Get number of tunnels configuration.
-
-        Returns:
-            Number of tunnels.
-        """
-        value = self.config.get("tunnels")
-        if value is None:
-            raise InvalidConfigError("tunnels configuration is missing")
-        tunnels = int(value)
-        if tunnels <= 1:
-            raise InvalidConfigError("tunnels configuration must be greater than 1")
-        return tunnels
-
-    def get_vips(self) -> list[ipaddress.IPv4Interface | ipaddress.IPv6Interface]:
-        """Get VRRP VIPs configuration.
-
-        Returns:
-            VRRP VIPs charm configuration.
-        """
-        value = str(self.config.get("vips", ""))
-        if not value:
-            return []
-        vips = []
-        for vip in value.split(","):
-            vip = vip.strip()
-            if not vip:
-                continue
-            try:
-                vips.append(ipaddress.ip_interface(vip))
-            except ValueError:
-                raise InvalidConfigError("invalid vip in vips config: {vip}")
-        return vips
-
     def reconcile(self, event: ops.EventBase) -> None:
         """Reconcile the charm.
 
@@ -168,19 +173,21 @@ class Charm(ops.CharmBase):
             event: Event.
         """
         try:
+            self._config = self.load_config(CharmConfig)
+        except pydantic.ValidationError as exc:
+            self.unit.status = ops.BlockedStatus(config_error_message(exc))
+            return
+        try:
             self._reconcile()
-            advertise_prefixes = ", ".join(map(str, self.get_advertise_prefixes()))
+            advertise_prefixes = ", ".join(map(str, self._config.advertise_prefixes))
             self.unit.status = ops.ActiveStatus(f"advertising prefixes: {advertise_prefixes}")
         except InvalidRelationDataError as exc:
-            self.unit.status = ops.BlockedStatus(str(exc))
-        except InvalidConfigError as exc:
             self.unit.status = ops.BlockedStatus(str(exc))
 
     def _reconcile(self) -> None:
         """Holistic reconciliation method."""
-        advertise_prefixes = self.get_advertise_prefixes()
-        vips = self.get_vips()
-        self.get_number_of_tunnels()
+        advertise_prefixes = self._config.advertise_prefixes
+        vips = self._config.vips
 
         packages = []
         packages.extend(wireguard.wireguard_to_install())
@@ -242,7 +249,7 @@ class Charm(ops.CharmBase):
         return data
 
     def _relation_add_keys(self, relation: relations.WireguardRouterRelation) -> None:
-        while len(self._wgdb.list_keys(relation.id)) < self.get_number_of_tunnels():
+        while len(self._wgdb.list_keys(relation.id)) < self._config.tunnels:
             keypair = wireguard.generate_keypair()
             self._wgdb.add_key(
                 owner=relation.id,
@@ -434,7 +441,7 @@ class Charm(ops.CharmBase):
 
     def _relation_sync(self, relation: relations.WireguardRouterRelation) -> None:
         """Write the WireGuard database data back to the relation."""
-        relation.set_advertise_prefixes(self.get_advertise_prefixes())
+        relation.set_advertise_prefixes(self._config.advertise_prefixes)
         relation.set_public_keys([k.public_key for k in self._wgdb.list_keys(relation.id)])
         relation.set_listen_ports(
             [
